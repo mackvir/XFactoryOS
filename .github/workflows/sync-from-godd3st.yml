@@ -1,62 +1,214 @@
 name: Sync XFactoryOS from GoDD3st
 
 on:
+  # Lancement manuel depuis GitHub Actions
   workflow_dispatch:
 
+  # Synchronisation automatique toutes les 24 heures
+  # 00:00 UTC
   schedule:
     - cron: "0 0 * * *"
 
+# Empêche deux synchronisations de modifier B simultanément
+concurrency:
+  group: xfactoryos-sync-a-to-b
+  cancel-in-progress: false
+
+# Autorisation nécessaire pour écrire dans B
 permissions:
   contents: write
 
 jobs:
   sync:
+    name: Synchronize A → B
     runs-on: ubuntu-latest
 
+    timeout-minutes: 15
+
     steps:
-      - name: Checkout destination repository
+
+      # ============================================================
+      # 1. Récupération du dépôt B
+      # ============================================================
+
+      - name: Checkout repository B
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
+          persist-credentials: true
 
-      - name: Clone source repository
-        run: |
-          git clone https://github.com/GoDD3st/XFactoryOS.git /tmp/source
+      # ============================================================
+      # 2. Récupération du dépôt A
+      # ============================================================
 
-      - name: Synchronize A to B
+      - name: Clone repository A
         run: |
-          rsync -a --delete \
+          echo "=========================================="
+          echo "Cloning source repository A"
+          echo "=========================================="
+
+          git clone \
+            --depth 1 \
+            --branch main \
+            https://github.com/GoDD3st/XFactoryOS.git \
+            /tmp/source
+
+          echo "Source repository cloned successfully."
+
+      # ============================================================
+      # 3. Affichage des versions
+      # ============================================================
+
+      - name: Display source and destination information
+        run: |
+          echo "=========================================="
+          echo "SOURCE A"
+          echo "=========================================="
+
+          cd /tmp/source
+          echo "Commit:"
+          git rev-parse HEAD
+
+          echo ""
+          echo "=========================================="
+          echo "DESTINATION B"
+          echo "=========================================="
+
+          cd "$GITHUB_WORKSPACE"
+          echo "Commit:"
+          git rev-parse HEAD
+
+      # ============================================================
+      # 4. Synchronisation A → B
+      # ============================================================
+
+      - name: Synchronize files A → B
+        run: |
+          echo "=========================================="
+          echo "Synchronizing files A → B"
+          echo "=========================================="
+
+          rsync -av \
+            --delete \
             --exclude='.git/' \
             --exclude='.github/workflows/' \
-            /tmp/source/ ./
+            /tmp/source/ \
+            "$GITHUB_WORKSPACE/"
 
-      - name: Check for changes
+          echo ""
+          echo "File synchronization completed."
+
+      # ============================================================
+      # 5. Détection des modifications
+      # ============================================================
+
+      - name: Detect changes
         id: changes
         run: |
+          echo "=========================================="
+          echo "Checking for changes"
+          echo "=========================================="
+
           git add -A
 
           if git diff --cached --quiet; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "Aucune modification détectée."
+
+            echo ""
+            echo "No changes detected."
+            echo "Repository B is already synchronized with A."
+
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "Des modifications ont été détectées."
+
+            echo ""
+            echo "Changes detected:"
+            echo ""
+
             git diff --cached --stat
+
+            echo ""
+            echo "Detailed changes:"
+            git diff --cached --name-status
           fi
 
-      - name: Commit changes
+      # ============================================================
+      # 6. Configuration Git
+      # ============================================================
+
+      - name: Configure Git
         if: steps.changes.outputs.changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git commit -m "chore: sync from GoDD3st/XFactoryOS"
+      # ============================================================
+      # 7. Création du commit
+      # ============================================================
 
-      - name: Push changes
+      - name: Create synchronization commit
         if: steps.changes.outputs.changed == 'true'
         run: |
-          git push origin main
+          echo "=========================================="
+          echo "Creating synchronization commit"
+          echo "=========================================="
 
-      - name: Synchronization completed
+          git commit \
+            -m "chore: sync XFactoryOS from GoDD3st"
+
+      # ============================================================
+      # 8. Récupération des dernières modifications de B
+      # ============================================================
+
+      - name: Update destination branch
+        if: steps.changes.outputs.changed == 'true'
         run: |
-          echo "Synchronisation A → B terminée."
+          echo "=========================================="
+          echo "Updating destination branch"
+          echo "=========================================="
+
+          git fetch origin main
+
+          git rebase origin/main
+
+      # ============================================================
+      # 9. Push vers B
+      # ============================================================
+
+      - name: Push synchronization
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          echo "=========================================="
+          echo "Pushing synchronization to B"
+          echo "=========================================="
+
+          git push origin HEAD:main
+
+          echo ""
+          echo "Push completed successfully."
+
+      # ============================================================
+      # 10. Résumé
+      # ============================================================
+
+      - name: Synchronization summary
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "SYNCHRONIZATION SUMMARY"
+          echo "=========================================="
+
+          if [ "${{ steps.changes.outputs.changed }}" = "true" ]; then
+            echo "Status      : SUCCESS"
+            echo "Direction   : A → B"
+            echo "Source      : GoDD3st/XFactoryOS"
+            echo "Destination : mackvir/XFactoryOS"
+            echo "Frequency   : Every 24 hours"
+          else
+            echo "Status      : NO CHANGES"
+            echo "Direction   : A → B"
+            echo "Repository B is already up to date."
+          fi
+
+          echo "=========================================="
