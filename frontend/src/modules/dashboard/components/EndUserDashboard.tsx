@@ -15,21 +15,23 @@ import {
   Zap,
   BookmarkCheck,
   AlertCircle,
-  FileText
-} from 'lucide-react';
+  FileText, ScanLine } from 'lucide-react';
 import { DigitalTwin } from '../../../shared/components/DigitalTwin';
-import { ReservationsTable } from '../../../shared/components/ReservationsTable';
 import { DateTimePicker24h } from '../../../shared/components/DateTimePicker24h';
 import { ExtensionRequestModal } from '../../../shared/components/ExtensionRequestModal';
+import { SeatBookingModal } from '../../../shared/components/SeatBookingModal';
 import { Workstation, Cluster, Reservation, ApprovalRequest, SystemSettings } from '../../../types';
 import { createReservation, syncReservationsFromDb } from '@/services/reservations/reservationService';
+import { fetchClustersWithOverlays } from '@/services/workspaces/workspaceService';
+import { validateReservationConstraints } from '@/frontend/src/shared/utils/dateValidation';
 import { apiCheckIn, apiCheckOut } from '@/services/api/checkinoutApi';
 import { apiJoinWaitingList } from '@/services/api/waitingListApi';
-import { apiCompleteApprovalRequest } from '@/services/api/approvalApi';
+import { apiCompleteApprovalRequest, apiFetchMyApprovalRequests } from '@/services/api/approvalApi';
 import { ReservationConflictError } from '@/services/api/reservationApi';
 import { ApprovalService } from '@/services/approval/approvalService';
 import { SettingsService } from '@/services/settings/settingsService';
 import { useAuth } from '../../../modules/auth/context/AuthContext';
+import { SelfSeatScanModal } from '@/frontend/src/shared/components/SelfSeatScanModal';
 
 
 // Returns the first valid booking date = today + bookingWindowDays, skipping weekends
@@ -62,11 +64,24 @@ export const EndUserDashboard: React.FC = () => {
   const [endTime, setEndTime] = useState<string>('18:00');
   const [purpose, setPurpose] = useState<string>('');
   const [notes, setNotes] = useState<string>('');
+  const [showSeatScan, setShowSeatScan] = useState(false);
   const [businessDaysCount, setBusinessDaysCount] = useState<number>(1);
   const [requiresExtension, setRequiresExtension] = useState<boolean>(false);
   const [validationError, setValidationError] = useState<string | undefined>();
   const [conflictAlternatives, setConflictAlternatives] = useState<{ code: string; cluster_name: string }[]>([]);
   const [reason, setReason] = useState<string>('');
+
+  // Which of the two paths produced the current selection, so the confirmation panel renders
+  // inside the section the user is actually working in rather than jumping to the other one.
+  const [selectionSource, setSelectionSource] = useState<'twin' | 'form' | null>(null);
+
+  // Path B (form first): the cluster narrows the seat list. Picking CL-A must show CL-A's seats
+  // and nothing else - previously the cluster only zoomed the floor plan while seat selection
+  // stayed global, so the filter did not actually constrain what you could book.
+  const [formClusterId, setFormClusterId] = useState<string>('');
+  const [formClusters, setFormClusters] = useState<Cluster[]>([]);
+  const [loadingSeats, setLoadingSeats] = useState<boolean>(false);
+
 
   // Extension Modal State
   const [isExtensionModalOpen, setIsExtensionModalOpen] = useState<boolean>(false);
@@ -94,12 +109,14 @@ export const EndUserDashboard: React.FC = () => {
     );
     setMyReservations(mine);
 
-    // Check if user has an approval request with 'needs_info' status (Re-Loop)
-    const pendingApprovals = await ApprovalService.getPendingApprovals();
-    const needsInfoReq = pendingApprovals.find(
-      (a) => a.requester_id === currentUser.id && a.status === 'needs_info'
-    );
-    setReLoopRequest(needsInfoReq || null);
+    // BPMN D2 "DEMANDER INFO": surface a request the validator sent back for more detail.
+    //
+    // This used to read getPendingApprovals(), which filters to status === 'pending', then search
+    // that list for status === 'needs_info' - mutually exclusive, so the banner never rendered and
+    // the re-clarification loop was unreachable. /api/approvals/mine returns the caller's own
+    // requests in every state.
+    const myRequests = await apiFetchMyApprovalRequests();
+    setReLoopRequest(myRequests.find((a) => a.status === 'needs_info') || null);
   };
 
   useEffect(() => {
@@ -169,9 +186,99 @@ export const EndUserDashboard: React.FC = () => {
     }
   };
 
+
+
+  /**
+   * Slot edits made inside the modal.
+   *
+   * Validation has to be re-run here, not left to DateTimePicker24h: that component only
+   * validates in response to its own inputs, so changing the date from the dialog moved the state
+   * without moving the verdict - a holiday stayed flagged after switching to a working day, and
+   * the confirm button stayed disabled with a stale message.
+   */
+  const handleModalSlotChange = (next: {
+    startDate: string;
+    endDate: string;
+    startTime: string;
+    endTime: string;
+  }) => {
+    setResDate(next.startDate);
+    setEndDate(next.endDate);
+    setStartTime(next.startTime);
+    setEndTime(next.endTime);
+
+    const result = validateReservationConstraints(
+      next.startDate,
+      next.endDate,
+      next.startTime,
+      next.endTime,
+      settings,
+      currentRole
+    );
+    setValidationError(result.errorMessage);
+    setBusinessDaysCount(result.businessDays);
+    setRequiresExtension(result.requiresExtensionApproval);
+    setConflictAlternatives([]);
+  };
+
   const handleSeatClickFromTwin = (ws: Workstation, cl: Cluster) => {
     setSelectedSeat({ workstation: ws, cluster: cl });
+    setSelectionSource('twin');
     setBookingSuccessMsg(null);
+  };
+
+  const handleSeatPickFromForm = (ws: Workstation, cl: Cluster) => {
+    setSelectedSeat({ workstation: ws, cluster: cl });
+    setSelectionSource('form');
+    setBookingSuccessMsg(null);
+  };
+
+  /**
+   * Seats for path B, resolved for the window already chosen in the form.
+   *
+   * fetchClustersWithOverlays attaches per-seat availability for exactly this date and window, so
+   * each row can say whether it is free, partly taken (and when), or gone - rather than making the
+   * user click a seat to find out.
+   */
+  useEffect(() => {
+    let cancelled = false;
+    if (!resDate) return;
+    setLoadingSeats(true);
+    fetchClustersWithOverlays({ date: resDate, startTime, endTime, currentUserId: currentUser.id })
+      .then((data) => {
+        if (!cancelled) setFormClusters(data);
+      })
+      .catch(() => {
+        if (!cancelled) setFormClusters([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLoadingSeats(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [resDate, startTime, endTime]);
+
+  /** Only the chosen cluster's seats, and only ones a collaborator may actually book. */
+  const seatsForChosenCluster = React.useMemo(() => {
+    const cluster = formClusters.find((c) => c.id === formClusterId);
+    if (!cluster) return [];
+    return cluster.workstations
+      .filter((w) => w.visibleToUsers !== false && w.status !== 'disabled')
+      .sort((a, b) => a.code.localeCompare(b.code));
+  }, [formClusters, formClusterId]);
+
+  /** One short phrase per seat describing this window, not the whole day. */
+  const seatAvailabilityLabel = (w: Workstation): { text: string; tone: 'free' | 'partial' | 'taken' } => {
+    if (w.status === 'maintenance') return { text: 'maintenance', tone: 'taken' };
+    const info = w.availability;
+    if (!info) return { text: w.status === 'disponible' ? 'libre' : 'occupé', tone: w.status === 'disponible' ? 'free' : 'taken' };
+    if (info.windowFree) return { text: 'libre', tone: 'free' };
+    if (info.busy.length > 0) {
+      const b = info.busy[0];
+      return { text: `occupé ${b.start}-${b.end}`, tone: info.gaps.length > 0 ? 'partial' : 'taken' };
+    }
+    return { text: 'occupé', tone: 'taken' };
   };
 
   const handleDateTimePickerChange = (data: {
@@ -197,6 +304,31 @@ export const EndUserDashboard: React.FC = () => {
    * taken for exactly these hours. If the holder never checks in, the no-show sweep offers this
    * desk to the queue in order, and the first person to accept gets it.
    */
+  /**
+   * Release a seat the viewer holds, from the seat dialog on the floor plan.
+   *
+   * The Twin renders the floor and does not mutate reservations, so it hands the id back here -
+   * the same division of labour as booking and queuing. deleteReservation is the identical call
+   * "Mes Réservations" makes, so cancelling from the plan and cancelling from the list cannot
+   * diverge in what they do to the record or the audit trail.
+   */
+  const handleCancelOwnReservation = async (
+    reservationId: string,
+    workstation: Workstation
+  ) => {
+    setValidationError(undefined);
+    try {
+      const { deleteReservation } = await import('@/services/reservations/reservationService');
+      await deleteReservation(reservationId);
+      setBookingSuccessMsg(`Réservation du poste ${workstation.code} annulée. Le poste est de nouveau disponible.`);
+      // Repaints the grid and lets the waiting-list cascade see the freed desk, rather than
+      // leaving the seat coloured as taken until something else happens to refresh.
+      window.dispatchEvent(new CustomEvent('xfactory_reservations_changed'));
+    } catch (err: any) {
+      setValidationError(err?.message || "Échec de l'annulation de la réservation.");
+    }
+  };
+
   const handleQueueSeat = async (
     workstation: Workstation,
     cluster: Cluster,
@@ -336,7 +468,7 @@ export const EndUserDashboard: React.FC = () => {
       )}
 
       {/* Hero Reservation Banner */}
-      <div className="bg-white text-slate-900 rounded-2xl p-6 sm:p-8 border border-slate-200 shadow-sm relative overflow-hidden">
+      <div className="bg-white text-slate-900 rounded-2xl p-4 sm:p-8 border border-slate-200 shadow-sm relative overflow-hidden">
         <div className="absolute top-0 right-0 w-96 h-96 bg-emerald-500/5 rounded-full blur-3xl -mr-20 -mt-20 pointer-events-none" />
 
         <div className="relative z-10 flex flex-col lg:flex-row lg:items-center justify-between gap-6">
@@ -349,6 +481,22 @@ export const EndUserDashboard: React.FC = () => {
             <p className="text-xs sm:text-sm text-slate-600 leading-relaxed font-medium">
               Réservez votre poste de travail Smart Open Space. (08:00 - 18:00).
             </p>
+
+            {/* Scanning the badge on the desk is the check-in, and it already worked from the
+                phone's own camera app - the QR encodes this site with ?scan=<token>. This button
+                is for when the app is already open, where being told to leave it, open the camera
+                app and come back is absurd, and for desktops, which have no camera app to leave
+                to. Same endpoint either way: the server reads the user from the session and the
+                desk from the signed token, and acts only if a reservation matches both. */}
+            <button
+              type="button"
+              onClick={() => setShowSeatScan(true)}
+              className="mt-1 inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold shadow-sm transition-colors"
+              title="Scanner le QR code collé sur le poste pour faire votre check-in ou check-out"
+            >
+              <ScanLine className="w-4 h-4 text-amber-300" />
+              Scanner le QR du poste
+            </button>
           </div>
 
           {activeHeroRes ? (
@@ -386,7 +534,7 @@ export const EndUserDashboard: React.FC = () => {
           time-critical thing this role does was absent from its home screen. */}
       {todayPresence && (
         <div
-          className={`rounded-2xl p-5 border shadow-sm space-y-3 ${
+          className={`rounded-2xl p-4 sm:p-5 border shadow-sm space-y-3 ${
             todayPresence.status === 'check-in'
               ? 'bg-emerald-50 border-emerald-200'
               : presenceMinutesLeft !== null && presenceMinutesLeft <= 0
@@ -448,14 +596,60 @@ export const EndUserDashboard: React.FC = () => {
         </div>
       )}
 
-      {/* Main Interactive Reservation Section */}
-      <div className="bg-white rounded-2xl p-6 border border-slate-200 shadow-sm space-y-6">
-        <h2 className="text-base font-bold text-slate-900 flex items-center gap-2 border-b border-slate-100 pb-3">
-          <span className="w-6 h-6 rounded-full bg-[#008751] text-white text-xs flex items-center justify-center font-black">!</span>
-          <span>Choisir la date et réserver un poste</span>
-        </h2>
+      {/* Booking success is reported once, above both paths, so it stays visible whichever one
+          was used instead of scrolling away with the section that produced it. */}
+      {bookingSuccessMsg && (
+        <div className="bg-emerald-50 border border-emerald-200 text-emerald-900 p-4 rounded-2xl flex items-center justify-between shadow-sm animate-in fade-in">
+          <div className="flex items-center space-x-2">
+            <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
+            <p className="text-xs font-bold">{bookingSuccessMsg}</p>
+          </div>
+          <button onClick={() => setBookingSuccessMsg(null)} className="text-xs font-bold text-emerald-700 hover:underline">
+            Fermer
+          </button>
+        </div>
+      )}
 
-        {/* Custom 24h DateTime Picker Component */}
+      {/* PATH A - from the floor plan.
+          For the user who knows where they want to sit. The cluster filter and the slot selector
+          live inside the twin, so the seat being clicked and the hours chosen are never in two
+          distant places on the page. */}
+      <div className="bg-white rounded-2xl p-4 sm:p-6 border border-slate-200 shadow-sm space-y-5">
+        <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
+          <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+            <span className="w-6 h-6 rounded-full bg-[#008751] text-white text-xs flex items-center justify-center font-black">1</span>
+            <span>Réserver depuis le plan</span>
+          </h2>
+          <p className="text-[11px] text-slate-500 text-right hidden sm:block">
+            Choisissez un cluster, puis un poste sur le plan.
+          </p>
+        </div>
+
+        <DigitalTwin
+          onSelectSeat={handleSeatClickFromTwin}
+          selectedSeatCode={selectedSeat?.workstation.code || null}
+          slotDate={resDate}
+          slotStart={startTime}
+          slotEnd={endTime}
+          onQueueSeat={handleQueueSeat}
+          onCancelOwnReservation={handleCancelOwnReservation}
+        />
+      </div>
+
+      {/* PATH B - from the form.
+          For the user who knows WHEN and does not mind which desk. The cluster genuinely narrows
+          the seat list here; previously it only zoomed the plan while seat choice stayed global. */}
+      <div className="bg-white rounded-2xl p-4 sm:p-6 border border-slate-200 shadow-sm space-y-5">
+        <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-3">
+          <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
+            <span className="w-6 h-6 rounded-full bg-slate-800 text-white text-xs flex items-center justify-center font-black">2</span>
+            <span>Ou réserver par formulaire</span>
+          </h2>
+          <p className="text-[11px] text-slate-500 text-right hidden sm:block">
+            Choisissez le créneau, puis le cluster et le poste.
+          </p>
+        </div>
+
         <DateTimePicker24h
           startDate={resDate}
           endDate={endDate}
@@ -466,135 +660,129 @@ export const EndUserDashboard: React.FC = () => {
           onChange={handleDateTimePickerChange}
         />
 
-        {/* Motif / Notes Optional */}
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <div>
-            <label className="block text-xs font-bold text-slate-700 mb-1">Motif du reservation</label>
-            <input
-              type="text"
-              value={purpose}
-              onChange={(e) => setPurpose(e.target.value)}
-              className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-medium text-slate-800 focus:ring-2 focus:ring-[#008751] outline-none"
-            />
-          </div>
-          <div>
-            <label className="block text-xs font-bold text-slate-700 mb-1">Notes complémentaires</label>
-            <input
-              type="text"
-              value={notes}
-              onChange={(e) => setNotes(e.target.value)}
-              className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-medium text-slate-800 focus:ring-2 focus:ring-[#008751] outline-none"
-            />
-          </div>
-        </div>
-
-        {/* Success Confirmation Toast */}
-        {bookingSuccessMsg && (
-          <div className="bg-emerald-50 border border-emerald-200 text-emerald-900 p-4 rounded-2xl flex items-center justify-between shadow-sm animate-in fade-in">
-            <div className="flex items-center space-x-2">
-              <CheckCircle2 className="w-5 h-5 text-emerald-600 shrink-0" />
-              <p className="text-xs font-bold">{bookingSuccessMsg}</p>
-            </div>
-            <button
-              onClick={() => setBookingSuccessMsg(null)}
-              className="text-xs font-bold text-emerald-700 hover:underline"
-            >
-              Fermer
-            </button>
-          </div>
-        )}
-
-        {/* Selected Seat Confirmation Panel */}
-        {selectedSeat && (
-          <div className="bg-slate-900 text-white rounded-2xl p-5 border border-slate-800 shadow-xl flex flex-col md:flex-row items-center justify-between gap-4 animate-in slide-in-from-top-2">
-            <div className="flex items-center space-x-4">
-              <div className="w-12 h-12 rounded-xl bg-[#00b050] text-white flex items-center justify-center font-black text-lg border-2 border-white/40 shadow-lg">
-                {selectedSeat.workstation.code.split('-')[2] || 'WS'}
-              </div>
+        {/* The picker refuses holidays, weekends and out-of-window dates. Nothing below can lead
+            anywhere until that is resolved, so the rest of the path is withheld rather than
+            letting someone fill in a form that cannot be submitted. */}
+        {validationError && !selectedSeat ? (
+          <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl p-3">
+            Corrigez la période ci-dessus pour choisir un poste.
+          </p>
+        ) : (
+          <>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div>
-                <div className="flex items-center space-x-2">
-                  <h3 className="text-lg font-black">{selectedSeat.workstation.code}</h3>
-                  <span className="text-xs px-2 py-0.5 rounded bg-emerald-500/30 text-emerald-200 font-semibold">
-                    {selectedSeat.cluster.name}
-                  </span>
-                </div>
-                <p className="text-xs text-slate-300 mt-0.5">
-                  Du <strong>{resDate}</strong> au <strong>{endDate || resDate}</strong> ({startTime} - {endTime}) | {businessDaysCount} jour{businessDaysCount > 1 ? 's' : ''} ouvré{businessDaysCount > 1 ? 's' : ''}
+                <label className="block text-xs font-bold text-slate-700 mb-1">Cluster</label>
+                <select
+                  value={formClusterId}
+                  onChange={(e) => {
+                    setFormClusterId(e.target.value);
+                    if (selectionSource === 'form') setSelectedSeat(null);
+                  }}
+                  className="w-full bg-slate-50 border border-slate-300 rounded-xl px-3 py-2 text-xs font-medium text-slate-800 focus:ring-2 focus:ring-[#008751] outline-none"
+                >
+                  <option value="">Sélectionner un cluster...</option>
+                  {formClusters.map((c) => (
+                    <option key={c.id} value={c.id}>
+                      {c.code} - {c.name} {c.is_management_only ? '(Restreint)' : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex items-end">
+                <p className="text-[11px] text-slate-500 pb-2">
+                  {formClusterId
+                    ? `${seatsForChosenCluster.length} poste(s) dans ce cluster`
+                    : 'Le choix du cluster filtre les postes proposés.'}
                 </p>
-                {validationError && (
-                  <p className="text-xs font-bold text-red-300 mt-1.5 flex items-center gap-1.5">
-                    <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                    {validationError}
+              </div>
+            </div>
+
+            {formClusterId && (
+              <div className="space-y-2">
+                <label className="block text-xs font-bold text-slate-700">
+                  Poste - disponibilité pour {startTime} - {endTime}
+                </label>
+
+                {loadingSeats ? (
+                  <p className="text-xs text-slate-400">Vérification des disponibilités...</p>
+                ) : seatsForChosenCluster.length === 0 ? (
+                  <p className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-xl p-3">
+                    Aucun poste visible dans ce cluster.
                   </p>
-                )}
-                {conflictAlternatives.length > 0 && (
-                  <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
-                    <span className="text-[11px] text-slate-300">Postes disponibles sur ce créneau :</span>
-                    {conflictAlternatives.map((alt) => (
-                      <span
-                        key={alt.code}
-                        className="px-2 py-0.5 rounded-lg bg-emerald-500/20 text-emerald-300 border border-emerald-400/30 text-[10px] font-bold"
-                      >
-                        {alt.code} ({alt.cluster_name})
-                      </span>
-                    ))}
+                ) : (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-2">
+                    {seatsForChosenCluster.map((w) => {
+                      const cluster = formClusters.find((c) => c.id === formClusterId)!;
+                      const label = seatAvailabilityLabel(w);
+                      const bookable = label.tone !== 'taken';
+                      const chosen = selectedSeat?.workstation.id === w.id && selectionSource === 'form';
+                      return (
+                        <button
+                          key={w.id}
+                          type="button"
+                          disabled={!bookable}
+                          onClick={() => handleSeatPickFromForm(w, cluster)}
+                          className={`text-left p-2.5 rounded-xl border transition-all ${
+                            chosen
+                              ? 'bg-slate-900 border-slate-900 text-white'
+                              : bookable
+                              ? 'bg-white border-slate-200 hover:border-[#008751] text-slate-800'
+                              : 'bg-slate-50 border-slate-200 text-slate-400 cursor-not-allowed'
+                          }`}
+                        >
+                          <span className="block text-xs font-bold">{w.code}</span>
+                          <span
+                            className={`block text-[10px] font-semibold mt-0.5 ${
+                              chosen
+                                ? 'text-emerald-300'
+                                : label.tone === 'free'
+                                ? 'text-emerald-700'
+                                : label.tone === 'partial'
+                                ? 'text-amber-700'
+                                : 'text-slate-400'
+                            }`}
+                          >
+                            {label.text}
+                          </span>
+                        </button>
+                      );
+                    })}
                   </div>
                 )}
               </div>
-            </div>
+            )}
 
-            <div className="flex items-center space-x-3 w-full md:w-auto justify-end">
-              <button
-                type="button"
-                onClick={() => setSelectedSeat(null)}
-                className="px-4 py-2 text-xs text-slate-300 hover:text-white font-bold"
-              >
-                Changer de poste
-              </button>
-
-              <button
-                onClick={handleConfirmBookingClick}
-                disabled={isSubmitting || !!validationError}
-                className={`px-6 py-2.5 rounded-xl text-xs font-extrabold shadow-lg flex items-center space-x-2 transition-all cursor-pointer ${
-                  requiresExtension
-                    ? 'bg-purple-600 hover:bg-purple-700 text-white shadow-purple-950/50'
-                    : 'bg-[#00b050] hover:bg-[#009040] text-white shadow-emerald-950/50'
-                }`}
-              >
-                {isSubmitting ? (
-                  <RefreshCw className="w-4 h-4 animate-spin" />
-                ) : requiresExtension ? (
-                  <Sparkles className="w-4 h-4" />
-                ) : (
-                  <Check className="w-4 h-4" />
-                )}
-                <span>
-                  {requiresExtension
-                    ? 'Formulaire d\'Extension (> 2j)'
-                    : 'Confirmer la réservation'}
-                </span>
-              </button>
-            </div>
-          </div>
+          </>
         )}
+      </div>
 
-        {/* Digital Twin 2D Floor Plan */}
-        {/* Slot is controlled by the booking form above, so the floor recolours as the user
-            changes date or hours instead of the screen carrying two pickers that can disagree. */}
-        <DigitalTwin
-          onSelectSeat={handleSeatClickFromTwin}
-          selectedSeatCode={selectedSeat?.workstation.code || null}
-          slotDate={resDate}
-          slotStart={startTime}
-          slotEnd={endTime}
-          onQueueSeat={handleQueueSeat}
+      {selectedSeat && (
+        <SeatBookingModal
+          isOpen
+          onClose={() => {
+            setSelectedSeat(null);
+            setSelectionSource(null);
+          }}
+          workstation={selectedSeat.workstation}
+          cluster={selectedSeat.cluster}
+          user={currentUser}
+          startDate={resDate}
+          endDate={endDate}
+          startTime={startTime}
+          endTime={endTime}
+          purpose={purpose}
+          notes={notes}
+          businessDays={businessDaysCount}
+          requiresExtension={requiresExtension}
+          isSubmitting={isSubmitting}
+          validationError={validationError}
+          conflictAlternatives={conflictAlternatives}
+          onSlotChange={handleModalSlotChange}
+          onPurposeChange={setPurpose}
+          onNotesChange={setNotes}
+          onConfirm={() => handleConfirmBookingClick(new Event('submit') as unknown as React.FormEvent)}
         />
-      </div>
-
-      {/* My Reservations Table */}
-      <div className="pt-4">
-        <ReservationsTable userOnly={true} />
-      </div>
+      )}
 
       {/* Extension Request Modal (> 2 Business Days) */}
       <ExtensionRequestModal
@@ -625,6 +813,17 @@ export const EndUserDashboard: React.FC = () => {
           approverFeedbackNote={reLoopRequest.decision_note}
         />
       )}
+      {showSeatScan && (
+        <SelfSeatScanModal
+          onClose={() => setShowSeatScan(false)}
+          onDone={() => {
+            // A scan changes a reservation's status, so the floor and the user's own list have to
+            // repaint - the same event the booking path dispatches.
+            window.dispatchEvent(new CustomEvent('xfactory_reservations_changed'));
+          }}
+        />
+      )}
     </div>
+
   );
 };

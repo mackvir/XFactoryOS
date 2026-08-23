@@ -13,6 +13,7 @@ import { apiFetchClusters } from '@/services/api/workspaceApi';
 import { apiFetchUsers } from '@/services/api/userApi';
 import { DigitalTwin } from '../../../shared/components/DigitalTwin';
 import { ReservationsTable } from '../../../shared/components/ReservationsTable';
+import { useAuth } from '../../auth/context/AuthContext';
 
 /**
  * Administrator home - SRS §13 Administrator column: CRUD on postes/clusters/utilisateurs/
@@ -26,6 +27,7 @@ import { ReservationsTable } from '../../../shared/components/ReservationsTable'
 const IN_USE_STATUSES = new Set(['réservé', 'occupé']);
 
 export const AdminView: React.FC = () => {
+  const { currentUser } = useAuth();
   const [clusters, setClusters] = useState<Cluster[]>([]);
   const [userCount, setUserCount] = useState<{ total: number; active: number } | null>(null);
   const [loading, setLoading] = useState(true);
@@ -88,18 +90,15 @@ export const AdminView: React.FC = () => {
 
   return (
     <div className="space-y-6">
-      <div className="bg-slate-900 text-white rounded-2xl p-6 border border-slate-800 shadow-lg">
+      <div className="bg-slate-900 text-white rounded-2xl p-4 sm:p-6 border border-slate-800 shadow-lg">
         <div className="flex items-center space-x-2">
           <span className="px-2.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-bold text-xs">
             Rôle : Administrator
           </span>
-          <span className="text-xs text-slate-400">Administration fonctionnelle - Site Safi</span>
         </div>
-        <h1 className="text-xl font-bold mt-1">Gestion des ressources &amp; règles Open Space</h1>
-        <p className="text-xs text-slate-400 mt-0.5">
-          Postes, clusters, utilisateurs et paramètres de réservation. L'administration technique
-          relève de l'IT Administrator.
-        </p>
+          <h1 className="text-xl font-bold mt-2">
+            Bienvenue {currentUser.full_name}
+          </h1>
       </div>
 
       {/* Referential counts */}

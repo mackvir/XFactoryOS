@@ -2,7 +2,6 @@ import 'dotenv/config';
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
-import { createServer as createViteServer } from 'vite';
 import { authRouter } from './routes/auth.routes';
 import { usersRouter } from './routes/users.routes';
 import { reservationsRouter } from './routes/reservations.routes';
@@ -20,16 +19,28 @@ import { checkInOutRouter } from './routes/checkinout.routes';
 import { rolesRouter } from './routes/roles.routes';
 import { approvalRouter } from './routes/approval.routes';
 import { searchRouter } from './routes/search.routes';
-import { settingsRouter } from './routes/settings.routes';
+import { settingsRouter, brandingRouter } from './routes/settings.routes';
 import { historyRouter } from './routes/history.routes';
+import { cronRouter } from './routes/cron.routes';
 import { seedDatabaseIfEmpty } from '../database/seeder';
 import { NoShowService } from '../services/noshow/noShowService';
-import { authenticateJWT } from './middleware/authMiddleware';
+import { authenticateJWT, assertDemoModeIsSafe } from './middleware/authMiddleware';
 import { apiGeneralLimiter } from './middleware/rateLimiter';
 
 
 export function createExpressApp() {
+  // Checked at app construction, so it fires on the serverless path too - startServer() never
+  // runs on Vercel, and a guard only in startServer() would protect exactly the deployment that
+  // does not need it.
+  assertDemoModeIsSafe();
+
   const app = express();
+
+  // Trust exactly one proxy hop (Vercel's edge). Without this `req.ip` is the proxy's address,
+  // so every caller shares a single rate-limit bucket and per-client limiting silently does
+  // nothing. Deliberately `1`, not `true`: trusting the whole X-Forwarded-For chain would let a
+  // client spoof its own source address and evade the limiter entirely.
+  app.set('trust proxy', 1);
 
   app.use(express.json());
 
@@ -88,6 +99,12 @@ export function createExpressApp() {
 
   // ZERO-TRUST GLOBAL MIDDLEWARE: Rate limiting + JWT Verification for ALL /api/* routes
   app.use('/api', apiGeneralLimiter);
+
+  // Mounted BEFORE authenticateJWT, deliberately: the login screen needs the site name and logo
+  // to render, and it has no session yet. Rate limiting above still applies. It exposes only
+  // those two fields - see brandingRouter in routes/settings.routes.ts.
+  app.use('/api/branding', brandingRouter);
+
   app.use('/api', authenticateJWT);
 
   // Microservices Express Routers (All protected by JWT + RBAC guards)
@@ -110,6 +127,8 @@ export function createExpressApp() {
   app.use('/api/search', searchRouter);
   app.use('/api/settings', settingsRouter);
   app.use('/api/history', historyRouter);
+  // Serverless scheduler entry point. Authenticated by CRON_SECRET, not by a user session.
+  app.use('/api/cron', cronRouter);
 
   return app;
 }
@@ -215,6 +234,15 @@ async function startServer() {
 
   // Vite middleware or Static files handler
   if (process.env.NODE_ENV !== 'production' && !process.env.VERCEL) {
+    // Imported here rather than at the top of the file, and the distinction is not stylistic.
+    //
+    // A static `import ... from 'vite'` is evaluated when the module loads, so the bundled server
+    // called require("vite") on every cold start - including on Vercel, where this branch never
+    // runs. vite is a dev dependency and is not in the deployed lambda, so that require threw
+    // before a single route was registered and every endpoint answered 500. A dev bundler has no
+    // business being loaded by a production server at all; deferring the import to the only place
+    // it is used makes the dependency as conditional as the code that needs it.
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'custom',

@@ -14,8 +14,10 @@ import { SiteTelemetrySummary } from '@/services/telemetry/telemetryService';
 import { apiFetchOccupancy } from '@/services/api/telemetryApi';
 import { apiFetchPendingApprovals } from '@/services/api/approvalApi';
 import { ApprovalRequest } from '../../../types';
+import { useAuth } from '../../auth/context/AuthContext';
 
 export const DirectionView: React.FC = () => {
+  const { currentUser } = useAuth();
   const [telemetry, setTelemetry] = useState<SiteTelemetrySummary | null>(null);
   // BR-06 makes approving long-duration reservations this role's defining function, but it was
   // absent from its home screen entirely - the pending queue lived only behind the Approbations
@@ -53,18 +55,16 @@ export const DirectionView: React.FC = () => {
   return (
     <div className="space-y-6">
       {/* Header Banner */}
-      <div className="bg-slate-900 text-white rounded-2xl p-6 border border-slate-800 shadow-lg flex flex-col md:flex-row md:items-center justify-between gap-4">
+      <div className="bg-slate-900 text-white rounded-2xl p-4 sm:p-6 border border-slate-800 shadow-lg flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <div className="flex items-center space-x-2">
             <span className="px-2.5 py-0.5 rounded bg-rose-500/20 text-rose-300 font-bold text-xs">
               Rôle : Directeur de Site
             </span>
-            <span className="text-xs text-slate-400">Direction Générale - Site Safi</span>
           </div>
-          <h1 className="text-xl font-bold mt-1">Tableau de Bord Exécutif & Métriques Stratégiques</h1>
-          <p className="text-xs text-slate-400 mt-0.5">
-            KPIs de performance globale et taux d'utilisation de l'Open Space, calculés en temps réel.
-          </p>
+          <h1 className="text-xl font-bold mt-2">
+            Bienvenue {currentUser.full_name}
+          </h1>
         </div>
 
         <button

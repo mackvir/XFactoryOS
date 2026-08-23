@@ -6,8 +6,10 @@ import {
   SystemSettings
 } from '../../types';
 import { apiFetchNotifications, apiMarkNotificationRead } from '@/services/api/notificationApi';
+// Settings come from the service (API-backed), not the repository: importing a database
+// repository into a browser component pulls the server-side data layer - and its Supabase admin
+// client wiring - into the client bundle.
 import { SettingsService } from '@/services/settings/settingsService';
-import { SettingsRepository } from '@/database/repositories/settingsRepository';
 import { useAuth, ROLE_CONFIGS } from '../../modules/auth/context/AuthContext';
 import { EndUserDashboard } from '../../modules/dashboard/components/EndUserDashboard';
 import { ReceptionView } from '../../modules/dashboard/views/ReceptionView';
@@ -39,6 +41,14 @@ import { ReservationRulesDrawer } from '../../modules/dashboard/components/Reser
 import { UserProfileDrawer } from '../../modules/dashboard/components/UserProfileDrawer';
 import { ForcePasswordChange } from '../../modules/auth/components/ForcePasswordChange';
 import { apiGetPasswordStatus } from '@/services/api/userApi';
+import { apiFetchMyPermissions, PERMISSIONS_CHANGED_EVENT } from '@/services/api/rolesApi';
+// The tab -> permission mapping and the baseline/policy merge rule live outside this file, in
+// services/rbac, next to the PermissionService the route guards use. Keeping them there is what
+// stops the menu and the guards from naming different permission codes: both are typed against
+// the same PERMISSION_CODES union, so a renamed permission breaks compilation in both places at
+// once instead of leaving one of them silently matching nothing.
+import { TabKey, resolveVisibleTabs } from '@/services/rbac/navigationPolicy';
+import { RoleGrants } from '@/services/rbac/permissionCodes';
 
 import {
   Layers,
@@ -64,18 +74,31 @@ import {
   Wrench,
   ListOrdered,
   History,
-  KeyRound
-} from 'lucide-react';
+  KeyRound, CalendarPlus, LogOut }
+from 'lucide-react';
 
 // RBAC Tab definitions per role (SRS Section 13 Matrix)
-type TabKey = 'home' | 'digital-twin' | 'reservations' | 'calendar' | 'waiting-list' | 'dashboard-exec' | 'workstations' | 'clusters' | 'users' | 'roles' | 'settings' | 'audit' | 'approvals' | 'cluster-auth' | 'late-checkin' | 'notifications';
-
 interface TabDef {
   key: TabKey;
   label: string;
   icon: React.ReactNode;
 }
 
+/**
+ * The per-role lists below are the BASELINE, not the final menu.
+ *
+ * They stay hand-curated - the comments on each block are load-bearing, and several of them
+ * explain why a tab is absent even though the role holds the permission behind it. What changed
+ * is that they are no longer the last word: useVisibleTabs() below overlays the live
+ * `role_permissions` policy on top, so a Super Admin granting a permission in the Roles &
+ * Permissions screen adds the matching tab, and revoking one removes it.
+ *
+ * The rules for how the two combine, and the short list of omissions the policy is not allowed to
+ * undo, are in services/rbac/navigationPolicy.ts. Read that before adding or removing a tab here.
+ *
+ * None of this is a security boundary. Every screen these tabs open is still guarded by
+ * requirePermission on the server, and no route guard was weakened to make this work.
+ */
 const ROLE_TABS: Record<UserRole, TabDef[]> = {
   collaborator: [
     { key: 'home', label: 'Digital Twin', icon: <Layers className="w-3.5 h-3.5" /> },
@@ -90,12 +113,14 @@ const ROLE_TABS: Record<UserRole, TabDef[]> = {
   // role no audit_logs read, so the endpoint answered 403 and the tab was dead.
   receptionist: [
     { key: 'home', label: 'Réception', icon: <Layers className="w-3.5 h-3.5" /> },
+    { key: 'reserve', label: 'Réserver', icon: <CalendarPlus className="w-3.5 h-3.5" /> },
     { key: 'reservations', label: 'Réservations', icon: <Calendar className="w-3.5 h-3.5" /> },
     { key: 'calendar', label: 'Calendrier', icon: <Clock className="w-3.5 h-3.5" /> },
     { key: 'waiting-list', label: 'Liste d\'Attente', icon: <ListOrdered className="w-3.5 h-3.5" /> },
   ],
   building_manager: [
     { key: 'home', label: 'Bâtiment', icon: <Building className="w-3.5 h-3.5" /> },
+    { key: 'reserve', label: 'Réserver', icon: <CalendarPlus className="w-3.5 h-3.5" /> },
     { key: 'dashboard-exec', label: 'Dashboard', icon: <BarChart3 className="w-3.5 h-3.5" /> },
     { key: 'reservations', label: 'Mes Réservations', icon: <Calendar className="w-3.5 h-3.5" /> },
     { key: 'calendar', label: 'Calendrier', icon: <Clock className="w-3.5 h-3.5" /> },
@@ -105,13 +130,13 @@ const ROLE_TABS: Record<UserRole, TabDef[]> = {
     { key: 'clusters', label: 'Clusters', icon: <Layers className="w-3.5 h-3.5" /> },
     { key: 'late-checkin', label: 'Check-in tardif', icon: <Clock className="w-3.5 h-3.5" /> },
     { key: 'users', label: 'Utilisateurs', icon: <Users className="w-3.5 h-3.5" /> },
-    { key: 'audit', label: 'Audit', icon: <FileText className="w-3.5 h-3.5" /> },
   ],
   // SRS §13 matrix, GCI Manager column: R dashboard/analytics/audit, C+U reservations (incl.
   // others'), A on "Autoriser cluster management", RU postes/clusters, R users. Roles and
   // Administration technique are X - they must stay absent from this menu.
   gci_manager: [
     { key: 'home', label: 'GCI', icon: <Shield className="w-3.5 h-3.5" /> },
+    { key: 'reserve', label: 'Réserver', icon: <CalendarPlus className="w-3.5 h-3.5" /> },
     { key: 'dashboard-exec', label: 'Dashboard', icon: <BarChart3 className="w-3.5 h-3.5" /> },
     { key: 'cluster-auth', label: 'Autorisations', icon: <KeyRound className="w-3.5 h-3.5" /> },
     { key: 'clusters', label: 'Clusters', icon: <Layers className="w-3.5 h-3.5" /> },
@@ -119,7 +144,6 @@ const ROLE_TABS: Record<UserRole, TabDef[]> = {
     { key: 'reservations', label: 'Réservations', icon: <Calendar className="w-3.5 h-3.5" /> },
     { key: 'calendar', label: 'Calendrier', icon: <Clock className="w-3.5 h-3.5" /> },
     { key: 'users', label: 'Utilisateurs', icon: <Users className="w-3.5 h-3.5" /> },
-    { key: 'audit', label: 'Audit', icon: <FileText className="w-3.5 h-3.5" /> },
   ],
   // SRS §13 matrix, Executive Assistant column: A on "Approuver longue durée" (its whole
   // mandate), R on Dashboard exécutif and Analytics, C on "Réserver poste standard", U on its
@@ -129,6 +153,7 @@ const ROLE_TABS: Record<UserRole, TabDef[]> = {
   // extension seats) and this role is read-only on the seat referential.
   executive_assistant: [
     { key: 'home', label: 'Approbations', icon: <CheckCircle2 className="w-3.5 h-3.5" /> },
+    { key: 'reserve', label: 'Réserver', icon: <CalendarPlus className="w-3.5 h-3.5" /> },
     { key: 'dashboard-exec', label: 'Dashboard', icon: <BarChart3 className="w-3.5 h-3.5" /> },
     { key: 'approvals', label: 'Longue Durée', icon: <Clock className="w-3.5 h-3.5" /> },
     { key: 'reservations', label: 'Mes Réservations', icon: <Calendar className="w-3.5 h-3.5" /> },
@@ -141,6 +166,7 @@ const ROLE_TABS: Record<UserRole, TabDef[]> = {
   // referential. "Audit" removed on a deliberate override - see audit.routes.ts.
   director: [
     { key: 'home', label: 'Direction', icon: <Sparkles className="w-3.5 h-3.5" /> },
+    { key: 'reserve', label: 'Réserver', icon: <CalendarPlus className="w-3.5 h-3.5" /> },
     { key: 'dashboard-exec', label: 'Dashboard', icon: <BarChart3 className="w-3.5 h-3.5" /> },
     { key: 'approvals', label: 'Approbations', icon: <CheckCircle2 className="w-3.5 h-3.5" /> },
     { key: 'reservations', label: 'Mes Réservations', icon: <Calendar className="w-3.5 h-3.5" /> },
@@ -150,6 +176,7 @@ const ROLE_TABS: Record<UserRole, TabDef[]> = {
   // it stays absent (that is IT Admin's mandate).
   admin: [
     { key: 'home', label: 'Admin', icon: <Settings className="w-3.5 h-3.5" /> },
+    { key: 'reserve', label: 'Réserver', icon: <CalendarPlus className="w-3.5 h-3.5" /> },
     { key: 'dashboard-exec', label: 'Dashboard', icon: <BarChart3 className="w-3.5 h-3.5" /> },
     { key: 'workstations', label: 'Postes', icon: <Wrench className="w-3.5 h-3.5" /> },
     { key: 'clusters', label: 'Clusters', icon: <Layers className="w-3.5 h-3.5" /> },
@@ -163,6 +190,7 @@ const ROLE_TABS: Record<UserRole, TabDef[]> = {
   ],
   super_admin: [
     { key: 'home', label: 'Console', icon: <ShieldCheck className="w-3.5 h-3.5" /> },
+    { key: 'reserve', label: 'Réserver', icon: <CalendarPlus className="w-3.5 h-3.5" /> },
     { key: 'dashboard-exec', label: 'Dashboard', icon: <BarChart3 className="w-3.5 h-3.5" /> },
     { key: 'reservations', label: 'Réservations', icon: <Calendar className="w-3.5 h-3.5" /> },
     { key: 'late-checkin', label: 'Check-in tardif', icon: <Clock className="w-3.5 h-3.5" /> },
@@ -182,14 +210,115 @@ const ROLE_TABS: Record<UserRole, TabDef[]> = {
   // is exactly the R the matrix grants - useful for application support.
   it_admin: [
     { key: 'home', label: 'IT Admin', icon: <Wrench className="w-3.5 h-3.5" /> },
+    { key: 'reserve', label: 'Réserver', icon: <CalendarPlus className="w-3.5 h-3.5" /> },
     { key: 'users', label: 'Utilisateurs', icon: <Users className="w-3.5 h-3.5" /> },
-    { key: 'audit', label: 'Audit', icon: <FileText className="w-3.5 h-3.5" /> },
   ],
+  // SRS §13 matrix, Security column: R on analytics/audit, and X on "Réserver poste standard" -
+  // a guard supervises the floor, it does not occupy a desk on it. Confirmed as intended rather
+  // than an oversight, so there is no "Réserver" tab here and reservations.routes.ts leaves the role
+  // out of RESERVE_FALLBACK_ROLES; changing it means amending the SRS, not patching this list.
   security_guard: [
     { key: 'home', label: 'Sécurité', icon: <Shield className="w-3.5 h-3.5" /> },
-    { key: 'audit', label: 'Audit', icon: <FileText className="w-3.5 h-3.5" /> },
   ],
 };
+
+/**
+ * Canonical label and icon for every tab, used only for tabs the POLICY adds to a role.
+ *
+ * A tab in a role's baseline keeps that role's own wording - 'home' is "Réception" for the
+ * receptionist and "Direction" for the director, 'roles' is "RBAC" on the Super Admin console and
+ * "Rôles" everywhere else. A tab that was never in the baseline has no such wording by
+ * definition, so it gets the neutral name here.
+ */
+const TAB_CATALOG: Record<TabKey, TabDef> = {
+  home: { key: 'home', label: 'Accueil', icon: <Layers className="w-3.5 h-3.5" /> },
+  'digital-twin': { key: 'digital-twin', label: 'Digital Twin', icon: <Layers className="w-3.5 h-3.5" /> },
+  reserve: { key: 'reserve', label: 'Réserver', icon: <CalendarPlus className="w-3.5 h-3.5" /> },
+  reservations: { key: 'reservations', label: 'Réservations', icon: <Calendar className="w-3.5 h-3.5" /> },
+  calendar: { key: 'calendar', label: 'Calendrier', icon: <Clock className="w-3.5 h-3.5" /> },
+  'waiting-list': { key: 'waiting-list', label: "Liste d'Attente", icon: <ListOrdered className="w-3.5 h-3.5" /> },
+  'dashboard-exec': { key: 'dashboard-exec', label: 'Dashboard', icon: <BarChart3 className="w-3.5 h-3.5" /> },
+  workstations: { key: 'workstations', label: 'Postes', icon: <Wrench className="w-3.5 h-3.5" /> },
+  clusters: { key: 'clusters', label: 'Clusters', icon: <Layers className="w-3.5 h-3.5" /> },
+  users: { key: 'users', label: 'Utilisateurs', icon: <Users className="w-3.5 h-3.5" /> },
+  roles: { key: 'roles', label: 'Rôles', icon: <Lock className="w-3.5 h-3.5" /> },
+  settings: { key: 'settings', label: 'Paramètres', icon: <Settings className="w-3.5 h-3.5" /> },
+  audit: { key: 'audit', label: 'Audit', icon: <FileText className="w-3.5 h-3.5" /> },
+  approvals: { key: 'approvals', label: 'Approbations', icon: <CheckCircle2 className="w-3.5 h-3.5" /> },
+  'cluster-auth': { key: 'cluster-auth', label: 'Autorisations', icon: <KeyRound className="w-3.5 h-3.5" /> },
+  'late-checkin': { key: 'late-checkin', label: 'Check-in tardif', icon: <Clock className="w-3.5 h-3.5" /> },
+  notifications: { key: 'notifications', label: 'Notifications', icon: <Bell className="w-3.5 h-3.5" /> },
+};
+
+/**
+ * The menu, resolved from the curated baseline plus the live policy table.
+ *
+ * Three behaviours worth stating, because each one was a decision:
+ *
+ * 1. WHILE THE FETCH IS IN FLIGHT the hook reports `resolved: false` and the nav renders inert
+ *    placeholders rather than the baseline. Painting the baseline first and correcting it a
+ *    moment later would flash tabs a revoked user is not supposed to have - the exact thing this
+ *    feature exists to prevent - and painting nothing would make the header jump. The wait is one
+ *    request against an in-memory cache on the server.
+ *
+ * 2. WHEN THE FETCH FAILS - offline, 500, no session yet, or the server reporting that it could
+ *    not read `role_permissions` - apiFetchMyPermissions() resolves to null and the resolver
+ *    returns the baseline untouched. This mirrors requirePermission: an unreadable policy table
+ *    degrades to the previous behaviour instead of locking everyone out. It is safe precisely
+ *    because it is not the authorization mechanism; the routes behind these tabs are still
+ *    guarded, and they fall back the same way.
+ *
+ * 3. IT RE-READS ON PERMISSIONS_CHANGED_EVENT, so a Super Admin editing their own role's grants
+ *    sees their menu follow immediately instead of after a reload.
+ */
+function useVisibleTabs(role: UserRole, baseline: TabDef[]): { tabs: TabDef[]; resolved: boolean } {
+  const [grants, setGrants] = useState<RoleGrants | null>(null);
+  const [resolved, setResolved] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    // Back to "unknown" on every role change: in demo mode the QA switcher changes role without
+    // remounting, and holding the previous role's grants would resolve the new role's menu
+    // against the wrong policy for one render.
+    setGrants(null);
+    setResolved(false);
+
+    const read = () => {
+      apiFetchMyPermissions()
+        .then((next) => {
+          if (cancelled) return;
+          setGrants(next);
+          setResolved(true);
+        })
+        .catch(() => {
+          // apiFetchMyPermissions already swallows its own failures into null; this is belt and
+          // braces so a rejection can never leave the nav stuck on placeholders forever.
+          if (cancelled) return;
+          setGrants(null);
+          setResolved(true);
+        });
+    };
+
+    read();
+    window.addEventListener(PERMISSIONS_CHANGED_EVENT, read);
+    return () => {
+      cancelled = true;
+      window.removeEventListener(PERMISSIONS_CHANGED_EVENT, read);
+    };
+  }, [role]);
+
+  const tabs = React.useMemo(() => {
+    if (!resolved) return [];
+    return resolveVisibleTabs(
+      role,
+      baseline.map((t) => t.key),
+      grants
+    ).map((key) => baseline.find((t) => t.key === key) ?? TAB_CATALOG[key]);
+  }, [role, baseline, grants, resolved]);
+
+  return { tabs, resolved };
+}
 
 export const RoleShell: React.FC = () => {
   const { currentRole, currentUser, roleConfig, switchRole, canView8Postes, isDemoMode, signOut, sessionIdleWarning, idleSecondsLeft, extendSession } = useAuth();
@@ -255,7 +384,7 @@ export const RoleShell: React.FC = () => {
 
     const refresh = () => {
       applyBranding(SettingsService.getSettings() as SystemSettings);
-      SettingsRepository.getSettings().then(applyBranding).catch(() => {});
+      Promise.resolve(SettingsService.getSettings()).then(applyBranding).catch(() => {});
     };
 
     refresh();
@@ -344,6 +473,11 @@ export const RoleShell: React.FC = () => {
         return renderHomeView();
       case 'dashboard-exec':
         return <ExecutiveDashboard />;
+      case 'reserve':
+        // Same two-path booking workspace the collaborator gets: Digital Twin first, form below.
+        // Every role here is also a person who books a desk, so the surface is identical rather
+        // than a reduced copy that would drift from it.
+        return <EndUserDashboard />;
       case 'reservations':
         return <MyReservationsView />;
       case 'calendar':
@@ -375,10 +509,24 @@ export const RoleShell: React.FC = () => {
     }
   };
 
-  const tabs = ROLE_TABS[currentRole] || ROLE_TABS.collaborator;
+  const baselineTabs = ROLE_TABS[currentRole] || ROLE_TABS.collaborator;
+  const { tabs, resolved: tabsResolved } = useVisibleTabs(currentRole, baselineTabs);
+
+  // If the policy removed the tab the user is currently standing on - a Super Admin revoking a
+  // permission from a role they themselves hold, or from their own session in demo mode - send
+  // them back to 'home', which is never policy-removable. Leaving them on the orphaned tab would
+  // show a screen whose every request now 403s, with no tab highlighted to explain why.
+  useEffect(() => {
+    if (!tabsResolved) return;
+    // Reached from the notification bell rather than the tab bar, so its absence from `tabs` is
+    // normal and must not bounce the user out of a notification they just opened.
+    if (activeTab === 'notifications') return;
+    if (!tabs.some((t) => t.key === activeTab)) setActiveTab('home');
+  }, [tabsResolved, tabs, activeTab]);
+
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans antialiased">
+    <div className="min-h-dvh bg-slate-50 text-slate-900 flex flex-col font-sans antialiased">
       {/* FR-04 idle session expiration warning */}
       {sessionIdleWarning && (
         <div className="fixed inset-0 z-[100] flex items-center justify-center bg-slate-950/70 backdrop-blur-sm p-4">
@@ -411,11 +559,14 @@ export const RoleShell: React.FC = () => {
       )}
 
       {/* Top Enterprise Header Bar - Professional Polish Design Theme */}
-      <header className="sticky top-0 z-40 h-14 bg-white border-b border-slate-200 flex items-center justify-between px-4 sm:px-6 shrink-0 shadow-sm">
+      <header className="sticky top-0 z-40 h-14 bg-white border-b border-slate-200 flex items-center justify-between px-3 sm:px-6 shrink-0 shadow-sm">
         <div className="max-w-7xl mx-auto w-full flex items-center justify-between gap-4">
           
           {/* App Logo & Title */}
-          <div className="flex items-center space-x-3 shrink-0">
+          {/* Was shrink-0, which meant the brand block kept its full width on a 375px screen and
+              pushed the controls off the right edge. The mark stays fixed; the title is what
+              yields. */}
+          <div className="flex items-center space-x-2 sm:space-x-3 min-w-0">
             {/* Site mark: the uploaded logo when one is configured, otherwise the XF initials.
                 Falling back rather than showing a broken image keeps the header intact on a fresh
                 install, and if the stored data URI ever fails to decode. */}
@@ -434,7 +585,7 @@ export const RoleShell: React.FC = () => {
             <div className="flex items-center space-x-3">
               <div>
                 <div className="flex items-center space-x-2">
-                  <h1 className="text-lg font-black tracking-tight uppercase text-slate-800 underline underline-offset-4 decoration-[#008751]">
+                  <h1 className="text-base sm:text-lg font-black tracking-tight uppercase text-slate-800 underline underline-offset-4 decoration-[#008751] truncate max-w-[5.5rem] sm:max-w-none">
                     {siteName}
                   </h1>
                 </div>
@@ -446,10 +597,13 @@ export const RoleShell: React.FC = () => {
             </div>
           </div>
 
-          {/* Center / Right: QA Testing 10-Role Switcher (demo mode only) */}
-          <div className="flex items-center space-x-3">
+          {/* Center / Right: QA Testing 10-Role Switcher (demo mode only)
+              min-w-0 and a tighter gap on mobile: this group is the reason the header used to
+              push the page 521px wide on a 375px screen. Its children could not shrink, so the
+              row simply ran off the side and took horizontal scrolling with it. */}
+          <div className="flex items-center gap-2 sm:gap-3 min-w-0">
             {isDemoMode ? (
-              <div className="relative" ref={roleMenuRef}>
+              <div className="relative min-w-0" ref={roleMenuRef}>
               {/* Click-to-open, not hover: the menu sits below the trigger with a gap, so moving
                   the pointer down to pick a role left the hover area and closed it before any
                   option could be reached. */}
@@ -464,10 +618,10 @@ export const RoleShell: React.FC = () => {
                     : 'bg-slate-100 hover:bg-slate-200/80 border-slate-200'
                 }`}
               >
-                <Shield className="w-4 h-4 text-emerald-600" />
-                <div className="flex items-center space-x-1.5 text-xs font-semibold text-slate-700">
+                <Shield className="w-4 h-4 text-emerald-600 shrink-0" />
+                <div className="flex items-center space-x-1.5 text-xs font-semibold text-slate-700 min-w-0">
                   <span className="text-[10px] font-bold text-slate-400 uppercase hidden md:inline">Role Switcher:</span>
-                  <span className="font-bold text-slate-800">{roleConfig.label}</span>
+                  <span className="font-bold text-slate-800 hidden sm:inline">{roleConfig.label}</span>
                   <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${roleConfig.badgeColor}`}>
                     {roleConfig.route}
                   </span>
@@ -523,21 +677,9 @@ export const RoleShell: React.FC = () => {
               )}
               </div>
             ) : (
-              <div className="flex items-center gap-2">
-                <div className="flex items-center bg-slate-100 rounded-full px-3.5 py-1.5 gap-2 border border-slate-200 text-slate-700">
-                  <Shield className="w-4 h-4 text-emerald-600" />
-                  <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold ${roleConfig.badgeColor}`}>
-                    {roleConfig.label}
-                  </span>
-                </div>
-                <button
-                  onClick={() => signOut()}
-                  className="text-[10px] font-bold text-slate-400 hover:text-red-600 uppercase tracking-wide px-2 py-1.5 rounded-lg hover:bg-red-50 transition-all"
-                  title="Se déconnecter"
-                >
-                  Déconnexion
-                </button>
-              </div>
+              /* Sign out moved into the profile panel, at the bottom - see UserProfileDrawer.
+                 Nothing is rendered here now: the avatar to the right opens that panel. */
+              null
             )}
 
             {/* Collaborators get the reservation rules instead of the AI assistant: Module 1 does
@@ -546,7 +688,7 @@ export const RoleShell: React.FC = () => {
             {canUseAssistant ? (
               <button
                 onClick={() => setIsAIOpen(true)}
-                className="p-2 rounded-xl bg-[#008751] hover:bg-emerald-600 text-white transition-colors shadow-sm"
+                className="shrink-0 p-2 rounded-xl bg-[#008751] hover:bg-emerald-600 text-white transition-colors shadow-sm"
                 title="XFactory AI Assistant"
               >
                 <Bot className="w-4 h-4 text-amber-300" />
@@ -554,7 +696,7 @@ export const RoleShell: React.FC = () => {
             ) : (
               <button
                 onClick={() => setIsRulesOpen(true)}
-                className="p-2 rounded-xl bg-[#008751] hover:bg-emerald-600 text-white transition-colors shadow-sm"
+                className="shrink-0 p-2 rounded-xl bg-[#008751] hover:bg-emerald-600 text-white transition-colors shadow-sm"
                 title="Règles de réservation"
               >
                 <Scale className="w-4 h-4 text-amber-300" />
@@ -565,7 +707,7 @@ export const RoleShell: React.FC = () => {
             <div className="relative">
               <button
                 onClick={handleOpenNotifications}
-                className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-600 transition-colors relative"
+                className="shrink-0 p-2 rounded-xl bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-600 transition-colors relative"
               >
                 <Bell className="w-4 h-4" />
                 {unreadCount > 0 && (
@@ -624,9 +766,12 @@ export const RoleShell: React.FC = () => {
               type="button"
               onClick={() => setIsProfileOpen(true)}
               title="Mon profil"
-              className="hidden sm:flex items-center space-x-2.5 border-l pl-4 border-slate-200 hover:opacity-80 transition-opacity"
+              className="shrink-0 flex items-center space-x-2.5 sm:border-l sm:pl-4 border-slate-200 hover:opacity-80 transition-opacity"
             >
-              <div className="text-right text-xs">
+              {/* The name and department are what a narrow header cannot afford; the avatar is
+                  what makes the profile panel reachable. Hiding the whole capsule below sm hid the
+                  button too, so on a phone there was no route into the panel at all. */}
+              <div className="hidden sm:block text-right text-xs">
                 <div className="font-bold text-slate-800 leading-none">{currentUser.full_name}</div>
                 <div className="text-[10px] text-slate-400 leading-none mt-1">{currentUser.department}</div>
               </div>
@@ -640,9 +785,20 @@ export const RoleShell: React.FC = () => {
       </header>
 
       {/* Tab Navigation Bar (SRS Section 28 - RBAC-filtered per role) */}
-      <nav className="bg-white border-b border-slate-200 px-4 sm:px-6 shrink-0">
+      <nav className="bg-white border-b border-slate-200 px-3 sm:px-6 shrink-0">
         <div className="max-w-7xl mx-auto w-full flex items-center space-x-1 overflow-x-auto py-1">
-          {tabs.map((tab) => (
+          {/* Inert placeholders while the policy read is in flight. Reserving the row's height
+              keeps the header from jumping, without guessing at tabs that may be about to
+              disappear. See useVisibleTabs for why the baseline is not painted first. */}
+          {!tabsResolved &&
+            [0, 1, 2, 3].map((i) => (
+              <div
+                key={`tab-skeleton-${i}`}
+                aria-hidden
+                className="h-[30px] w-24 rounded-lg bg-slate-100 animate-pulse shrink-0"
+              />
+            ))}
+          {tabsResolved && tabs.map((tab) => (
             <button
               key={tab.key}
               onClick={() => setActiveTab(tab.key)}
@@ -660,7 +816,9 @@ export const RoleShell: React.FC = () => {
       </nav>
 
       {/* Main Role View Content Container */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6">
+      {/* Tighter gutter on a phone. At 375px the 16px page padding and a card's own 24px came
+          to 80px - 21% of the screen - before any content. Unchanged from sm upwards. */}
+      <main className="flex-1 max-w-7xl w-full mx-auto px-3 sm:px-6 lg:px-8 py-4 sm:py-6">
         {renderActiveView()}
       </main>
 
@@ -670,10 +828,12 @@ export const RoleShell: React.FC = () => {
           database while Postgres was down, and the version contradicted the repository. Neither
           is a collaborator's, receptionist's, director's or approver's concern - real platform
           health is probed by /api/health and shown in the IT Administrator console. */}
-      <footer className="h-8 bg-[#005A36] text-white flex items-center justify-between px-6 shrink-0 text-[10px]">
-        <div className="flex items-center gap-2">
-          <span className="w-2 h-2 rounded-full bg-amber-400" />
-          <span className="font-bold uppercase tracking-wider text-amber-100">{siteName}</span>
+      <footer className="h-8 bg-[#005A36] text-white flex items-center justify-between px-3 sm:px-6 shrink-0 text-[10px]">
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="w-2 h-2 rounded-full bg-amber-400 shrink-0" />
+          {/* A long site name has nowhere to go in a fixed 2rem bar - truncate rather than push
+              the build tag off the screen. */}
+          <span className="font-bold uppercase tracking-wider text-amber-100 truncate">{siteName}</span>
         </div>
         <span className="text-emerald-200 font-mono tracking-widest hidden md:inline">SFI-XFACTORY</span>
       </footer>
