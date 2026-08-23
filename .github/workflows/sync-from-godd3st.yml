@@ -3,6 +3,9 @@ name: Sync XFactoryOS from GoDD3st
 on:
   workflow_dispatch:
 
+  schedule:
+    - cron: "0 * * * *"
+
 permissions:
   contents: write
 
@@ -17,26 +20,43 @@ jobs:
           fetch-depth: 0
 
       - name: Clone source repository
-        run: git clone https://github.com/GoDD3st/XFactoryOS.git /tmp/source
+        run: |
+          git clone https://github.com/GoDD3st/XFactoryOS.git /tmp/source
 
       - name: Synchronize A to B
         run: |
           rsync -a --delete \
             --exclude='.git/' \
-            --exclude='.github/workflows/sync-from-godd3st.yml' \
+            --exclude='.github/workflows/' \
             /tmp/source/ ./
 
-      - name: Commit and push changes
+      - name: Check for changes
+        id: changes
+        run: |
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Aucune modification détectée."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Des modifications ont été détectées."
+            git diff --cached --stat
+          fi
+
+      - name: Commit changes
+        if: steps.changes.outputs.changed == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add -A
-
-          if git diff --cached --quiet; then
-            echo "No changes to synchronize."
-            exit 0
-          fi
-
           git commit -m "chore: sync from GoDD3st/XFactoryOS"
+
+      - name: Push changes
+        if: steps.changes.outputs.changed == 'true'
+        run: |
           git push origin main
+
+      - name: Synchronization completed
+        run: |
+          echo "Synchronisation A → B terminée."
