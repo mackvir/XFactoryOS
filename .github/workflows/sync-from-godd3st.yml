@@ -1,0 +1,42 @@
+name: Sync XFactoryOS from GoDD3st
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout destination repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone source repository
+        run: git clone https://github.com/GoDD3st/XFactoryOS.git /tmp/source
+
+      - name: Synchronize A to B
+        run: |
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/workflows/sync-from-godd3st.yml' \
+            /tmp/source/ ./
+
+      - name: Commit and push changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to synchronize."
+            exit 0
+          fi
+
+          git commit -m "chore: sync from GoDD3st/XFactoryOS"
+          git push origin main
